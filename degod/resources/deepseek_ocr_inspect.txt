@@ -1,0 +1,146 @@
+>>> Inspecting DeepseekOCRModel...
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        images: Optional[torch.FloatTensor] = None,
+        images_seq_mask: Optional[torch.FloatTensor] = None,
+        images_spatial_crop: Optional[torch.FloatTensor] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, BaseModelOutputWithPast]:
+
+
+
+
+        if inputs_embeds is None:
+            # inputs_embeds = self.embed_tokens(input_ids)
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+
+
+
+        sam_model = getattr(self, 'sam_model', None)
+        # sam_model = self.sam_model
+        vision_model = getattr(self, 'vision_model', None)
+
+
+
+        if sam_model is not None and (input_ids.shape[1] != 1 or self.training) and torch.sum(images[0][1]).item() != 0:
+
+            idx = 0
+            
+            # sam_model = torch.jit.script(sam_model)
+            
+            # start_time = time.time()
+            for image, crop_shape in zip(images, images_spatial_crop):
+                images_in_this_batch = []
+
+                patches = image[0]
+                image_ori = image[1]
+
+                with torch.no_grad():
+                # with torch.inference_mode(): 
+                    
+                    if torch.sum(patches).item() != 0:
+                        # P, C, H, W = patches.shape
+                        crop_flag = 1
+                        local_features_1 = sam_model(patches)
+
+                        local_features_2 = vision_model(patches, local_features_1)  
+                        # vit_time = time.time()
+                        local_features = torch.cat((local_features_2[:, 1:], local_features_1.flatten(2).permute(0, 2, 1)), dim=-1) 
+                        local_features = self.projector(local_features)
+
+
+                        global_features_1 = sam_model(image_ori)
+                        global_features_2 = vision_model(image_ori, global_features_1) 
+                        global_features = torch.cat((global_features_2[:, 1:], global_features_1.flatten(2).permute(0, 2, 1)), dim=-1) 
+                        global_features = self.projector(global_features)
+
+                        print('=====================')
+                        print('BASE: ', global_features.shape)
+                        print('PATCHES: ', local_features.shape)
+                        print('=====================')
+
+                        _, hw, n_dim = global_features.shape
+                        h = w = int(hw ** 0.5)
+
+                        _2, hw2, n_dim2 = local_features.shape
+                        h2 = w2 = int(hw2 ** 0.5)
+
+                        width_crop_num, height_crop_num = crop_shape[0], crop_shape[1]
+
+                        global_features = global_features.view(h, w, n_dim)
+
+                        global_features = torch.cat(
+                            [global_features, self.image_newline[None, None, :].expand(h, 1, n_dim)], dim=1
+                        )
+
+                        global_features = global_features.view(-1, n_dim)
+
+
+                        local_features = local_features.view(height_crop_num, width_crop_num, h2, w2, n_dim2).permute(0, 2, 1, 3, 4).reshape(height_crop_num*h2, width_crop_num*w2, n_dim2)
+                        local_features = torch.cat(
+                            [local_features, self.image_newline[None, None, :].expand(height_crop_num * h2, 1, n_dim2)], dim=1
+                        )
+                        local_features = local_features.view(-1, n_dim2)
+
+                        global_local_features = torch.cat([local_features, global_features, self.view_seperator[None, :]], dim=0)
+
+                        # end_time = time.time()
+
+                        # print('sam: ', sam_time - start_time)
+                        # print('vit: ', vit_time - sam_time)
+                        # print('all: ', end_time - start_time)
+
+                        # exit()
+                   
+                    else:
+                        global_features_1 = sam_model(image_ori)
+                        global_features_2 = vision_model(image_ori, global_features_1) 
+                        global_features = torch.cat((global_features_2[:, 1:], global_features_1.flatten(2).permute(0, 2, 1)), dim=-1) 
+                        global_features = self.projector(global_features)
+                        print('=====================')
+                        print('BASE: ', global_features.shape)
+                        print('NO PATCHES')
+                        print('=====================')
+                        _, hw, n_dim = global_features.shape
+                        h = w = int(hw ** 0.5)
+
+
+                        global_features = global_features.view(h, w, n_dim)
+
+                        global_features = torch.cat(
+                            [global_features, self.image_newline[None, None, :].expand(h, 1, n_dim)], dim=1
+                        )
+
+                        global_features = global_features.view(-1, n_dim)
+
+                        global_local_features = torch.cat([global_features, self.view_seperator[None, :]], dim=0)
+
+                    images_in_this_batch.append(global_local_features)
+                
+
+                # print(inputs_embeds.shape)
+
+                if images_in_this_batch:
+                    images_in_this_batch = torch.cat(images_in_this_batch, dim=0)
+                    # exit()
+
+                    inputs_embeds[idx].masked_scatter_(images_seq_mask[idx].unsqueeze(-1).cuda(), images_in_this_batch)
+
+                idx += 1
+            
+
+        return super(DeepseekOCRModel, self).forward(
+            input_ids=None, attention_mask=attention_mask, past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds, use_cache=use_cache, position_ids = position_ids,
+            output_attentions=output_attentions, output_hidden_states=output_hidden_states,
+            return_dict=return_dict
+        )
+
